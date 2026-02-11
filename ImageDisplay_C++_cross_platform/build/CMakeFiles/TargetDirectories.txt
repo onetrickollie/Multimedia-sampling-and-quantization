@@ -1,0 +1,3 @@
+/Users/lucasliu/Desktop/Classes/CSCI576/Multimedia-sampling-and-quantization/ImageDisplay_C++_cross_platform/build/CMakeFiles/MyImageApplication.dir
+/Users/lucasliu/Desktop/Classes/CSCI576/Multimedia-sampling-and-quantization/ImageDisplay_C++_cross_platform/build/CMakeFiles/edit_cache.dir
+/Users/lucasliu/Desktop/Classes/CSCI576/Multimedia-sampling-and-quantization/ImageDisplay_C++_cross_platform/build/CMakeFiles/rebuild_cache.dir

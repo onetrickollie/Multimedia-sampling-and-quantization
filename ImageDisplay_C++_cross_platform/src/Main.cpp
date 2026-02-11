@@ -108,6 +108,77 @@ static inline unsigned char avg3x3(const unsigned char* inData, int inW, int inH
  * Returns malloc() buffer for wxImage ownership.
  * Also returns outW/outH via references.
  */
+unsigned char quantizeOptimal(unsigned char v,
+                              const vector<int>& representatives) {
+    int bestIdx = 0;
+    int bestDist = abs(v - representatives[0]);
+
+    for (int i = 1; i < (int)representatives.size(); i++) {
+        int dist = abs(v - representatives[i]);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = i;
+        }
+    }
+
+    return (unsigned char)representatives[bestIdx];
+}
+
+vector<int> buildOptimalLevels(const unsigned char* data,
+                               int totalPixels,
+                               int bitsPerChannel,
+                               int channelOffset) {
+
+    int L = 1 << bitsPerChannel;
+
+    // Initialize centers uniformly
+    vector<double> centers(L);
+    for (int i = 0; i < L; i++) {
+        centers[i] = (double)i / (L - 1) * 255.0;
+    }
+
+    // Iterate Lloyd algorithm (10 iterations is enough)
+    for (int iter = 0; iter < 10; iter++) {
+
+        vector<double> sum(L, 0.0);
+        vector<int> count(L, 0);
+
+        for (int i = 0; i < totalPixels; i++) {
+            int value = data[i * 3 + channelOffset];
+
+            // Find closest center
+            int bestIdx = 0;
+            double bestDist = abs(value - centers[0]);
+
+            for (int k = 1; k < L; k++) {
+                double dist = abs(value - centers[k]);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = k;
+                }
+            }
+
+            sum[bestIdx] += value;
+            count[bestIdx]++;
+        }
+
+        // Update centers
+        for (int k = 0; k < L; k++) {
+            if (count[k] > 0)
+                centers[k] = sum[k] / count[k];
+        }
+    }
+
+    // Convert to integer representatives
+    vector<int> reps(L);
+    for (int i = 0; i < L; i++) {
+        reps[i] = clampInt((int)round(centers[i]), 0, 255);
+    }
+
+    return reps;
+}
+
+
 unsigned char* processImage(const string& imagePath,
                             int inW, int inH,
                             float S, int Q, int M, int E,
@@ -132,6 +203,14 @@ unsigned char* processImage(const string& imagePath,
 
   // Bits per channel (for now we assume equal split; extra credit comes later)
   int bitsPerChannel = (E == 0) ? (Q / 3) : (Q / 3);
+  vector<int> optR, optG, optB;
+
+  if (M == 256 && S == 1.0f) {
+      int totalPixels = inW * inH;
+      optR = buildOptimalLevels(original, totalPixels, bitsPerChannel, 0);
+      optG = buildOptimalLevels(original, totalPixels, bitsPerChannel, 1);
+      optB = buildOptimalLevels(original, totalPixels, bitsPerChannel, 2);
+  }
 
   // Resample: for each output pixel, map back to input coordinate, filter, then quantize
   for (int y = 0; y < outH; y++) {
@@ -184,9 +263,15 @@ unsigned char* processImage(const string& imagePath,
             qv = clampInt(reconstructed, 0, 255);
 
         } else if (M == 256) {
-            // For now, use uniform (we'll replace with optimal next)
-            qv = quantizeUniform(filtered, bitsPerChannel);
+            if (S == 1.0f) {
+                if (c == 0) qv = quantizeOptimal(filtered, optR);
+                else if (c == 1) qv = quantizeOptimal(filtered, optG);
+                else qv = quantizeOptimal(filtered, optB);
+            } else {
+                qv = quantizeUniform(filtered, bitsPerChannel);
+            }
         }
+
 
 
         outData[(y * outW + x) * 3 + c] = qv;
@@ -195,7 +280,7 @@ unsigned char* processImage(const string& imagePath,
   }
 
   // Analysis metrics (only meaningful when S=1.0 and you have a quantized output)
-  if (S == 1.0f && M == -1) {
+  if (S == 1.0f) {
     long long mseSum = 0;
     long long maeSum = 0;
 
