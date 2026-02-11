@@ -62,7 +62,7 @@ static inline int clampInt(int v, int lo, int hi) {
  */
 static inline unsigned char quantizeUniform(unsigned char v, int bitsPerChannel) {
   if (bitsPerChannel >= 8) return v;
-  if (bitsPerChannel <= 0) return 0;
+  if (bitsPerChannel <= 0) bitsPerChannel = 1; // keep it safe
 
   int L = 1 << bitsPerChannel; // number of levels
   int step = 256 / L;          // interval size in [0..255]
@@ -100,85 +100,198 @@ static inline unsigned char avg3x3(const unsigned char* inData, int inW, int inH
 }
 
 /**
+ * Optimal interval quantization helpers (M=256)
+ * We'll use a simple Lloyd-Max style update for representative levels.
+ */
+static inline unsigned char quantizeOptimal(unsigned char v,
+                                            const vector<int>& representatives) {
+  int bestIdx = 0;
+  int bestDist = abs((int)v - representatives[0]);
+
+  for (int i = 1; i < (int)representatives.size(); i++) {
+    int dist = abs((int)v - representatives[i]);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  return (unsigned char)representatives[bestIdx];
+}
+
+static inline vector<int> buildOptimalLevels(const unsigned char* data,
+                                             int totalPixels,
+                                             int bitsPerChannel,
+                                             int channelOffset) {
+  int L = 1 << bitsPerChannel;
+
+  // Initialize centers uniformly
+  vector<double> centers(L);
+  for (int i = 0; i < L; i++) {
+    centers[i] = (double)i / (L - 1) * 255.0;
+  }
+
+  // Iterate Lloyd algorithm (fixed iterations; good enough for this assignment)
+  for (int iter = 0; iter < 10; iter++) {
+    vector<double> sum(L, 0.0);
+    vector<int> count(L, 0);
+
+    for (int i = 0; i < totalPixels; i++) {
+      int value = (int)data[i * 3 + channelOffset];
+
+      // Find closest center
+      int bestIdx = 0;
+      double bestDist = fabs(value - centers[0]);
+      for (int k = 1; k < L; k++) {
+        double dist = fabs(value - centers[k]);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = k;
+        }
+      }
+
+      sum[bestIdx] += value;
+      count[bestIdx]++;
+    }
+
+    // Update centers
+    for (int k = 0; k < L; k++) {
+      if (count[k] > 0) centers[k] = sum[k] / count[k];
+    }
+  }
+
+  // Convert to integer representatives
+  vector<int> reps(L);
+  for (int i = 0; i < L; i++) {
+    reps[i] = clampInt((int)lround(centers[i]), 0, 255);
+  }
+  return reps;
+}
+
+/**
+ * Logarithmic interval quantization (M in 0..255, assignment calls this "pivot")
+ * We build L log-spaced bins on [0..M] and [M..255] and use bin-centers as reps.
+ */
+static inline void buildLogBins(int M, int L,
+                                vector<int>& edges, vector<int>& reps) {
+  edges.clear();
+  reps.clear();
+  edges.reserve(L + 1);
+  reps.reserve(L);
+
+  // Special cases
+  if (L <= 1) {
+    edges.push_back(0); edges.push_back(256);
+    reps.push_back(128);
+    return;
+  }
+
+  // We want more bins where values are "important" around the pivot.
+  // We'll do half bins on left, half on right (difference at most 1).
+  int leftBins = L / 2;
+  int rightBins = L - leftBins;
+
+  // Build edges: [0..M] (left), then [M..255] (right).
+  // Use log spacing: x = A * (exp(t) - 1)
+  // For left: 0..M
+  // For right: M..255
+  vector<int> leftEdges;
+  vector<int> rightEdges;
+
+  leftEdges.reserve(leftBins + 1);
+  rightEdges.reserve(rightBins + 1);
+
+  // Left edges
+  if (leftBins == 0) {
+    leftEdges.push_back(0);
+    leftEdges.push_back(M);
+  } else {
+    leftEdges.push_back(0);
+    double denom = log(1.0 + (double)max(M, 1));
+    for (int i = 1; i <= leftBins; i++) {
+      double t = (double)i / (double)leftBins;
+      int e = (int)lround( (exp(t * denom) - 1.0) );
+      e = clampInt(e, 0, M);
+      leftEdges.push_back(e);
+    }
+    leftEdges.back() = M;
+  }
+
+  // Right edges
+  if (rightBins == 0) {
+    rightEdges.push_back(M);
+    rightEdges.push_back(255);
+  } else {
+    rightEdges.push_back(M);
+    int span = 255 - M;
+    double denom = log(1.0 + (double)max(span, 1));
+    for (int i = 1; i <= rightBins; i++) {
+      double t = (double)i / (double)rightBins;
+      int e = (int)lround( M + (exp(t * denom) - 1.0) );
+      e = clampInt(e, M, 255);
+      rightEdges.push_back(e);
+    }
+    rightEdges.back() = 255;
+  }
+
+  // Merge into edges with a final top edge as 256 for convenience in indexing
+  // edges size should be L+1
+  edges.push_back(0);
+
+  // Left internal edges (skip 0)
+  for (int i = 1; i < (int)leftEdges.size(); i++) edges.push_back(leftEdges[i]);
+
+  // Right internal edges (skip M because already included as last left edge)
+  // But only if leftBins > 0; if leftBins == 0, 0..M is not really split.
+  int startRight = 1; // skip M
+  for (int i = startRight; i < (int)rightEdges.size(); i++) edges.push_back(rightEdges[i]);
+
+  // Ensure we have L+1 edges; if rounding caused duplicates, fix by forcing monotonic
+  // and padding/trimming.
+  // Force non-decreasing:
+  for (int i = 1; i < (int)edges.size(); i++) {
+    if (edges[i] < edges[i-1]) edges[i] = edges[i-1];
+  }
+
+  // Make sure last edge is 255, then push 256 as final boundary
+  if (!edges.empty()) edges.back() = 255;
+  edges.push_back(256);
+
+  // Now compute reps (centers of [edges[i], edges[i+1]) but clamp 0..255
+  reps.resize(L);
+  for (int i = 0; i < L; i++) {
+    int a = edges[i];
+    int b = edges[i + 1];
+    int center = (a + (b - 1)) / 2; // integer center of discrete interval
+    reps[i] = clampInt(center, 0, 255);
+  }
+}
+
+static inline unsigned char quantizeLog(unsigned char v, int M, int bitsPerChannel) {
+  int L = 1 << bitsPerChannel;
+
+  vector<int> edges, reps;
+  buildLogBins(M, L, edges, reps);
+
+  int iv = (int)v;
+  // Find interval i such that edges[i] <= iv < edges[i+1]
+  int i = 0;
+  // Linear scan is fine (L <= 256). Could binary-search but not necessary.
+  for (; i < L; i++) {
+    if (iv >= edges[i] && iv < edges[i + 1]) break;
+  }
+  if (i >= L) i = L - 1;
+  return (unsigned char)reps[i];
+}
+
+/**
  * Process pipeline:
  * 1) Read original 512x512 RGB
  * 2) Resample with 3x3 filter when S != 1.0
- * 3) Quantize (only uniform for now, M=-1)
+ * 3) Quantize (uniform / log / optimal)
  *
  * Returns malloc() buffer for wxImage ownership.
  * Also returns outW/outH via references.
  */
-unsigned char quantizeOptimal(unsigned char v,
-                              const vector<int>& representatives) {
-    int bestIdx = 0;
-    int bestDist = abs(v - representatives[0]);
-
-    for (int i = 1; i < (int)representatives.size(); i++) {
-        int dist = abs(v - representatives[i]);
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestIdx = i;
-        }
-    }
-
-    return (unsigned char)representatives[bestIdx];
-}
-
-vector<int> buildOptimalLevels(const unsigned char* data,
-                               int totalPixels,
-                               int bitsPerChannel,
-                               int channelOffset) {
-
-    int L = 1 << bitsPerChannel;
-
-    // Initialize centers uniformly
-    vector<double> centers(L);
-    for (int i = 0; i < L; i++) {
-        centers[i] = (double)i / (L - 1) * 255.0;
-    }
-
-    // Iterate Lloyd algorithm (10 iterations is enough)
-    for (int iter = 0; iter < 10; iter++) {
-
-        vector<double> sum(L, 0.0);
-        vector<int> count(L, 0);
-
-        for (int i = 0; i < totalPixels; i++) {
-            int value = data[i * 3 + channelOffset];
-
-            // Find closest center
-            int bestIdx = 0;
-            double bestDist = abs(value - centers[0]);
-
-            for (int k = 1; k < L; k++) {
-                double dist = abs(value - centers[k]);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestIdx = k;
-                }
-            }
-
-            sum[bestIdx] += value;
-            count[bestIdx]++;
-        }
-
-        // Update centers
-        for (int k = 0; k < L; k++) {
-            if (count[k] > 0)
-                centers[k] = sum[k] / count[k];
-        }
-    }
-
-    // Convert to integer representatives
-    vector<int> reps(L);
-    for (int i = 0; i < L; i++) {
-        reps[i] = clampInt((int)round(centers[i]), 0, 255);
-    }
-
-    return reps;
-}
-
-
 unsigned char* processImage(const string& imagePath,
                             int inW, int inH,
                             float S, int Q, int M, int E,
@@ -187,12 +300,12 @@ unsigned char* processImage(const string& imagePath,
   unsigned char* original = readImageData(imagePath, inW, inH);
 
   // Compute output dimensions
-  outW = static_cast<int>(std::lround(inW * S));
-  outH = static_cast<int>(std::lround(inH * S));
+  outW = static_cast<int>(lround(inW * S));
+  outH = static_cast<int>(lround(inH * S));
 
   cout << "Input:  " << inW << "x" << inH << "\n";
-  cout << "Output: " << outW << "x" << outH << "  (S=" << S << ", Q=" << Q << ", M=" << M << ", E=" << E << ")\n";
-
+  cout << "Output: " << outW << "x" << outH
+       << "  (S=" << S << ", Q=" << Q << ", M=" << M << ", E=" << E << ")\n";
 
   if (outW < 1) outW = 1;
   if (outH < 1) outH = 1;
@@ -203,13 +316,14 @@ unsigned char* processImage(const string& imagePath,
 
   // Bits per channel (for now we assume equal split; extra credit comes later)
   int bitsPerChannel = (E == 0) ? (Q / 3) : (Q / 3);
-  vector<int> optR, optG, optB;
 
-  if (M == 256 && S == 1.0f) {
-      int totalPixels = inW * inH;
-      optR = buildOptimalLevels(original, totalPixels, bitsPerChannel, 0);
-      optG = buildOptimalLevels(original, totalPixels, bitsPerChannel, 1);
-      optB = buildOptimalLevels(original, totalPixels, bitsPerChannel, 2);
+  // Precompute optimal representatives if needed (M=256)
+  vector<int> optR, optG, optB;
+  if (M == 256) {
+    int totalPixels = inW * inH;
+    optR = buildOptimalLevels(original, totalPixels, bitsPerChannel, 0);
+    optG = buildOptimalLevels(original, totalPixels, bitsPerChannel, 1);
+    optB = buildOptimalLevels(original, totalPixels, bitsPerChannel, 2);
   }
 
   // Resample: for each output pixel, map back to input coordinate, filter, then quantize
@@ -219,8 +333,8 @@ unsigned char* processImage(const string& imagePath,
       float xf = (S == 0.0f) ? 0.0f : (x / S);
       float yf = (S == 0.0f) ? 0.0f : (y / S);
 
-      int cx = static_cast<int>(std::lround(xf));
-      int cy = static_cast<int>(std::lround(yf));
+      int cx = (int)lround(xf);
+      int cy = (int)lround(yf);
       cx = clampInt(cx, 0, inW - 1);
       cy = clampInt(cy, 0, inH - 1);
 
@@ -238,49 +352,27 @@ unsigned char* processImage(const string& imagePath,
         unsigned char qv = filtered;
 
         if (M == -1) {
-            // Uniform
-            qv = quantizeUniform(filtered, bitsPerChannel);
+          // Uniform
+          qv = quantizeUniform(filtered, bitsPerChannel);
 
-        } else if (M > 0 && M < 255) {
-            // Logarithmic quantization around pivot M
-
-            int L = 1 << bitsPerChannel;
-            double pivot = (double)M;
-            double normalized;
-
-            if (filtered < pivot) {
-                normalized = log(1 + (pivot - filtered)) / log(1 + pivot);
-                normalized = 1.0 - normalized;
-            } else {
-                normalized = log(1 + (filtered - pivot)) / log(1 + (255 - pivot));
-                normalized = 1.0 + normalized;
-            }
-
-            int level = (int)(normalized * (L / 2));
-            level = clampInt(level, 0, L - 1);
-
-            int reconstructed = (int)((double)level / (L - 1) * 255.0);
-            qv = clampInt(reconstructed, 0, 255);
+        } else if (M >= 0 && M <= 255) {
+          // Logarithmic quantization around pivot M
+          qv = quantizeLog(filtered, M, bitsPerChannel);
 
         } else if (M == 256) {
-            if (S == 1.0f) {
-                if (c == 0) qv = quantizeOptimal(filtered, optR);
-                else if (c == 1) qv = quantizeOptimal(filtered, optG);
-                else qv = quantizeOptimal(filtered, optB);
-            } else {
-                qv = quantizeUniform(filtered, bitsPerChannel);
-            }
+          // Optimal interval quantization using Lloyd-style reps
+          if (c == 0) qv = quantizeOptimal(filtered, optR);
+          else if (c == 1) qv = quantizeOptimal(filtered, optG);
+          else qv = quantizeOptimal(filtered, optB);
         }
-
-
 
         outData[(y * outW + x) * 3 + c] = qv;
       }
     }
   }
 
-  // Analysis metrics (only meaningful when S=1.0 and you have a quantized output)
-  if (S == 1.0f) {
+  // Analysis metrics (only meaningful when S=1.0 and output is same size)
+  if (S == 1.0f && outW == inW && outH == inH) {
     long long mseSum = 0;
     long long maeSum = 0;
 
@@ -320,10 +412,10 @@ bool MyApp::OnInit() {
   }
 
   string imagePath = wxApp::argv[1].ToStdString();
-  float S = std::stof(wxApp::argv[2].ToStdString());
-  int Q = std::stoi(wxApp::argv[3].ToStdString());
-  int M = std::stoi(wxApp::argv[4].ToStdString());
-  int E = (wxApp::argc == 6) ? std::stoi(wxApp::argv[5].ToStdString()) : 0;
+  float S = stof(wxApp::argv[2].ToStdString());
+  int Q = stoi(wxApp::argv[3].ToStdString());
+  int M = stoi(wxApp::argv[4].ToStdString());
+  int E = (wxApp::argc == 6) ? stoi(wxApp::argv[5].ToStdString()) : 0;
 
   // basic validation
   if (!(S > 0.0f && S <= 1.0f)) { cerr << "Error: S must be in (0,1].\n"; exit(1); }
@@ -415,7 +507,6 @@ unsigned char *readImageData(string imagePath, int width, int height) {
    * of all the pixels followed by the B values of all pixels.
    * Hence we read the data in that order.
    */
-
   inputFile.read(Rbuf.data(), width * height);
   inputFile.read(Gbuf.data(), width * height);
   inputFile.read(Bbuf.data(), width * height);
