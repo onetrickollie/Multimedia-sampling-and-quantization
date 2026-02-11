@@ -158,14 +158,36 @@ unsigned char* processImage(const string& imagePath,
 
         unsigned char qv = filtered;
 
-        // Quantization mode selection (we implement uniform first)
         if (M == -1) {
-          qv = quantizeUniform(filtered, bitsPerChannel);
-        } else {
-          // TODO: implement logarithmic (0..255) and optimal (256)
-          // For now, pass through unmodified so you can still see scaling.
-          qv = filtered;
+            // Uniform
+            qv = quantizeUniform(filtered, bitsPerChannel);
+
+        } else if (M > 0 && M < 255) {
+            // Logarithmic quantization around pivot M
+
+            int L = 1 << bitsPerChannel;
+            double pivot = (double)M;
+            double normalized;
+
+            if (filtered < pivot) {
+                normalized = log(1 + (pivot - filtered)) / log(1 + pivot);
+                normalized = 1.0 - normalized;
+            } else {
+                normalized = log(1 + (filtered - pivot)) / log(1 + (255 - pivot));
+                normalized = 1.0 + normalized;
+            }
+
+            int level = (int)(normalized * (L / 2));
+            level = clampInt(level, 0, L - 1);
+
+            int reconstructed = (int)((double)level / (L - 1) * 255.0);
+            qv = clampInt(reconstructed, 0, 255);
+
+        } else if (M == 256) {
+            // For now, use uniform (we'll replace with optimal next)
+            qv = quantizeUniform(filtered, bitsPerChannel);
         }
+
 
         outData[(y * outW + x) * 3 + c] = qv;
       }
