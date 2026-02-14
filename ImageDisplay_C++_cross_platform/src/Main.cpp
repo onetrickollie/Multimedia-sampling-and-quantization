@@ -62,7 +62,7 @@ static inline int clampInt(int v, int lo, int hi) {
  */
 static inline unsigned char quantizeUniform(unsigned char v, int bitsPerChannel) {
   if (bitsPerChannel >= 8) return v;
-  if (bitsPerChannel <= 0) bitsPerChannel = 1; // keep it safe
+  if (bitsPerChannel <= 0) bitsPerChannel = 1;
 
   int L = 1 << bitsPerChannel; // number of levels
   int step = 256 / L;          // interval size in [0..255]
@@ -130,7 +130,7 @@ static inline vector<int> buildOptimalLevels(const unsigned char* data,
     centers[i] = (double)i / (L - 1) * 255.0;
   }
 
-  // Iterate Lloyd algorithm (fixed iterations; good enough for this assignment)
+  // Iterate Lloyd algorithm (fixed iterations)
   for (int iter = 0; iter < 10; iter++) {
     vector<double> sum(L, 0.0);
     vector<int> count(L, 0);
@@ -168,100 +168,117 @@ static inline vector<int> buildOptimalLevels(const unsigned char* data,
 }
 
 /**
- * Logarithmic interval quantization (M in 0..255, assignment calls this "pivot")
- * We build L log-spaced bins on [0..M] and [M..255] and use bin-centers as reps.
+ * FIXED: Logarithmic interval quantization (M in 0..255, pivot point)
+ * 
+ * Strategy: Create L bins total where bins near M are smaller (more precision)
+ * and bins far from M are larger (less precision).
+ * 
+ * We use exponential spacing: bins grow exponentially as we move away from M.
  */
-static inline void buildLogBins(int M, int L,
-                                vector<int>& edges, vector<int>& reps) {
+/**
+ * FIXED: Logarithmic interval quantization
+ * Create L bins with exponential spacing around pivot M.
+ * Bins near M are smaller (higher precision), bins far from M are larger.
+ */
+static inline void buildLogBins(int M, int L, vector<int>& edges, vector<int>& reps) {
   edges.clear();
   reps.clear();
-  edges.reserve(L + 1);
-  reps.reserve(L);
-
-  // Special cases
-  if (L <= 1) {
-    edges.push_back(0); edges.push_back(256);
-    reps.push_back(128);
+  
+  if (L <= 0) return;
+  
+  // Special case: only 1 level
+  if (L == 1) {
+    edges = {0, 256};
+    reps = {128};
     return;
   }
-
-  // We want more bins where values are "important" around the pivot.
-  // We'll do half bins on left, half on right (difference at most 1).
-  int leftBins = L / 2;
+  
+  // Allocate bins proportionally to range size
+  int leftRange = M - 0;        // [0, M]
+  int rightRange = 255 - M;     // [M, 255]
+  
+  // Number of bins on each side
+  int leftBins = (int)round((double)L * leftRange / 256.0);
   int rightBins = L - leftBins;
-
-  // Build edges: [0..M] (left), then [M..255] (right).
-  // Use log spacing: x = A * (exp(t) - 1)
-  // For left: 0..M
-  // For right: M..255
-  vector<int> leftEdges;
-  vector<int> rightEdges;
-
-  leftEdges.reserve(leftBins + 1);
-  rightEdges.reserve(rightBins + 1);
-
-  // Left edges
-  if (leftBins == 0) {
-    leftEdges.push_back(0);
-    leftEdges.push_back(M);
-  } else {
-    leftEdges.push_back(0);
-    double denom = log(1.0 + (double)max(M, 1));
-    for (int i = 1; i <= leftBins; i++) {
+  
+  // Edge cases: ensure at least some bins on each side if M is not at boundary
+  if (M > 0 && leftBins == 0) {
+    leftBins = 1;
+    rightBins = L - 1;
+  }
+  if (M < 255 && rightBins == 0) {
+    rightBins = 1;
+    leftBins = L - 1;
+  }
+  
+  // Generate exponential spacing parameter
+  double k = 2.0; // controls curvature
+  
+  vector<double> allEdges;
+  allEdges.push_back(0.0);
+  
+  // LEFT SIDE [0, M]: Generate internal edges
+  // We want leftBins bins on the left, which means leftBins-1 internal edges
+  if (leftBins > 0) {
+    for (int i = 1; i < leftBins; i++) {
       double t = (double)i / (double)leftBins;
-      int e = (int)lround( (exp(t * denom) - 1.0) );
-      e = clampInt(e, 0, M);
-      leftEdges.push_back(e);
+      double tRev = 1.0 - t;
+      double normalized = (exp(tRev * k) - 1.0) / (exp(k) - 1.0);
+      double edgeVal = M * (1.0 - normalized);
+      allEdges.push_back(edgeVal);
     }
-    leftEdges.back() = M;
   }
-
-  // Right edges
-  if (rightBins == 0) {
-    rightEdges.push_back(M);
-    rightEdges.push_back(255);
-  } else {
-    rightEdges.push_back(M);
-    int span = 255 - M;
-    double denom = log(1.0 + (double)max(span, 1));
-    for (int i = 1; i <= rightBins; i++) {
+  
+  // Add M as boundary (only if it's not at 0 or 255)
+  if (M > 0 && M < 255) {
+    allEdges.push_back((double)M);
+  }
+  
+  // RIGHT SIDE [M, 255]: Generate internal edges
+  // We want rightBins bins on the right, which means rightBins-1 internal edges
+  if (rightBins > 0) {
+    for (int i = 1; i < rightBins; i++) {
       double t = (double)i / (double)rightBins;
-      int e = (int)lround( M + (exp(t * denom) - 1.0) );
-      e = clampInt(e, M, 255);
-      rightEdges.push_back(e);
+      double normalized = (exp(t * k) - 1.0) / (exp(k) - 1.0);
+      double edgeVal = M + (255.0 - M) * normalized;
+      allEdges.push_back(edgeVal);
     }
-    rightEdges.back() = 255;
   }
-
-  // Merge into edges with a final top edge as 256 for convenience in indexing
-  // edges size should be L+1
-  edges.push_back(0);
-
-  // Left internal edges (skip 0)
-  for (int i = 1; i < (int)leftEdges.size(); i++) edges.push_back(leftEdges[i]);
-
-  // Right internal edges (skip M because already included as last left edge)
-  // But only if leftBins > 0; if leftBins == 0, 0..M is not really split.
-  int startRight = 1; // skip M
-  for (int i = startRight; i < (int)rightEdges.size(); i++) edges.push_back(rightEdges[i]);
-
-  // Ensure we have L+1 edges; if rounding caused duplicates, fix by forcing monotonic
-  // and padding/trimming.
-  // Force non-decreasing:
+  
+  // Add final boundary at 256
+  allEdges.push_back(256.0);
+  
+  // Convert to integers and ensure monotonic
+  edges.clear();
+  for (double e : allEdges) {
+    edges.push_back(clampInt((int)round(e), 0, 256));
+  }
+  
+  // Force monotonic and remove duplicates
+  vector<int> cleanEdges;
+  cleanEdges.push_back(edges[0]);
   for (int i = 1; i < (int)edges.size(); i++) {
-    if (edges[i] < edges[i-1]) edges[i] = edges[i-1];
+    if (edges[i] > cleanEdges.back()) {
+      cleanEdges.push_back(edges[i]);
+    }
   }
-
-  // Make sure last edge is 255, then push 256 as final boundary
-  if (!edges.empty()) edges.back() = 255;
-  edges.push_back(256);
-
-  // Now compute reps (centers of [edges[i], edges[i+1]) but clamp 0..255
+  edges = cleanEdges;
+  
+  // If we don't have exactly L+1 edges, fallback to uniform
+  if ((int)edges.size() != L + 1) {
+    edges.clear();
+    for (int i = 0; i <= L; i++) {
+      edges.push_back(i * 256 / L);
+    }
+    edges.back() = 256;
+  }
+  
+  // Compute representative values (bin centers)
   reps.resize(L);
   for (int i = 0; i < L; i++) {
     int a = edges[i];
     int b = edges[i + 1];
-    int center = (a + (b - 1)) / 2; // integer center of discrete interval
+    int center = (a + b - 1) / 2;
     reps[i] = clampInt(center, 0, 255);
   }
 }
@@ -275,7 +292,6 @@ static inline unsigned char quantizeLog(unsigned char v, int M, int bitsPerChann
   int iv = (int)v;
   // Find interval i such that edges[i] <= iv < edges[i+1]
   int i = 0;
-  // Linear scan is fine (L <= 256). Could binary-search but not necessary.
   for (; i < L; i++) {
     if (iv >= edges[i] && iv < edges[i + 1]) break;
   }
